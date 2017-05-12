@@ -1,0 +1,268 @@
+---
+
+- hosts: all
+  become: true
+  become_method: sudo
+  user: ubuntu
+  vars:
+   - jenkins_user: 'jenkins-build'
+   # jenkins API credentials:
+   - api_user: 'ceph-jenkins'
+   - token: '{{ token }}'
+   - api_uri: 'https://jenkins.ceph.com'
+   - nodename: '{{ nodename }}'
+   - labels: '{{ labels }}'
+   - use_jnlp: false
+
+  tasks:
+
+    - name: Check for epel
+      shell: "yum repolist | grep -i -q epel"
+      register: epel_check
+      failed_when: false
+
+    - name: Install epel repo
+      yum_repository:
+        name: epel
+        description: EPEL YUM repo
+        baseurl: https://download.fedoraproject.org/pub/epel/$releasever/$basearch/
+        gpgcheck: no
+      when: epel_check.rc != 0
+
+    # vagrant doesn't have repositories, this chacra repo will be better to have
+    # around and can get updates as soon as a new vagrant version is published via
+    # chacractl
+    - name: get the vagrant repo
+      yum_repository:
+        name: vagrant
+        description: chacra vagrant repo
+        baseurl: https://chacra.ceph.com/r/vagrant/latest/HEAD/centos/7/flavors/default/x86_64/
+        gpgcheck: no
+
+    - name: run yum clean all
+      command: yum clean all
+
+    - name: Install requirements
+      yum:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      with_items:
+        - git
+        - gcc
+        - python-devel
+        - libffi-devel
+        - java-1.8.0-openjdk-devel
+        - qemu-kvm
+        - libvirt-devel
+        - libguestfs
+        - libvirt
+        - libguestfs-tools
+        - vagrant
+        - wget
+        - curl
+        - jq
+        - python-virtualenv
+        - openssl-devel
+        - python-pip
+
+    - name: create a {{ jenkins_user }} user
+      user:
+        name: "{{ jenkins_user }}"
+        append: yes
+        comment: "Jenkins Build Slave User"
+
+    - name: add {{ jenkins_user }} user to libvirt group
+      user:
+        name: "{{ jenkins_user }}"
+        append: yes
+        groups: "libvirt"
+
+    - name: create a {{ jenkins_user }} home directory
+      file:
+        path: "/home/{{ jenkins_user }}/"
+        state: directory
+        owner: "{{ jenkins_user }}"
+
+    - name: Create .ssh directory
+      file:
+        path: "/home/{{ jenkins_user }}/.ssh"
+        state: directory
+        owner: "{{ jenkins_user }}"
+
+    - name: install the vagrant-libvirt plugin
+      shell: vagrant plugin install vagrant-libvirt
+      become: yes
+      become_user: "{{ jenkins_user }}"
+
+    - name: set the authorized keys
+      authorized_key: user={{ jenkins_user }} key="{{ lookup('file', 'playbook/files/ssh/keys/jenkins_build.pub') }}"
+
+    - name: ensure {{ jenkins_user }} can sudo without a prompt
+      lineinfile:
+        dest: /etc/sudoers
+        regexp: '^{{ jenkins_user }} ALL'
+        line: '{{ jenkins_user }}   ALL=(ALL:ALL) NOPASSWD:ALL'
+        validate: 'visudo -cf %s'
+
+    - name: set utf-8 for LC_ALL
+      lineinfile:
+        dest: "/home/{{ jenkins_user }}/.bashrc"
+        regexp: '^export LC_ALL='
+        line: "export LC_ALL=en_US.UTF-8"
+        create: true
+        state: present
+
+    - name: set utf-8 for LANG
+      lineinfile:
+        dest: "/home/{{ jenkins_user }}/.bashrc"
+        regexp: '^export LANG='
+        line: "export LANG=en_US.UTF-8"
+
+    - name: set utf-8 for LANGUAGE
+      lineinfile:
+        dest: "/home/{{ jenkins_user }}/.bashrc"
+        regexp: '^export LANGUAGE='
+        line: "export LANGUAGE=en_US.UTF-8"
+
+    - name: ensure the build dir exists
+      file: path=/home/{{ jenkins_user }}/build state=directory owner={{ jenkins_user }}
+
+    - name: ensure the home dir has the right owner permissions
+      file: path=/home/{{ jenkins_user }} state=directory owner={{ jenkins_user }} group={{ jenkins_user }} recurse=yes
+
+    - name: ensure the gitconfig file exists
+      shell: printf "[user]\name=Ceph CI\nemail=ceph-release-team@redhat.com\n" > /home/{{ jenkins_user }}/.gitconfig
+
+    - name: ensure the gitconfig file has right permissions
+      file:
+        path: "/home/{{ jenkins_user }}/.gitconfig"
+        owner: "{{ jenkins_user }}"
+
+    - name: Set Hostname with hostname command
+      hostname:
+        name: "ceph-builders"
+
+    - name: ensure that 127.0.1.1 is present with an actual hostname
+      lineinfile:
+        dest: /etc/hosts
+        line: '127.0.1.1 ceph-builders'
+
+    # we need to update the cloud templates because 'manage_etc_hosts' is
+    # set to true on the image we use in OVH and some jobs will reboot
+    # these nodes causing the /etc/hosts file to be replace with these
+    # templates making jobs fail because the hostname is not resolvable
+    # not all our images have this setting though, so ignore failures on
+    # those nodes
+    - name: update the etc cloud templates for debian /etc/hosts
+      lineinfile:
+        dest: /etc/cloud/templates/hosts.debian.tmpl
+        line: '127.0.1.1 ceph-builders'
+      failed_when: false
+
+    - name: update the etc cloud templates for debian /etc/hosts
+      lineinfile:
+        dest: /etc/cloud/templates/hosts.redhat.tmpl
+        line: '127.0.1.1 ceph-builders'
+      failed_when: false
+
+    - name: configure libvirt permissions for {{ jenkins_user }}
+      blockinfile:
+        dest: /etc/libvirt/qemu.conf
+        block: |
+          user = "{{ jenkins_user }}"
+          group = "{{ jenkins_user }}"
+
+    - name: restart the libvirtd service
+      service:
+        name: libvirtd
+        state: restarted
+
+    - name: make sure modules managed by pip are not installed by yum
+      yum:
+        name: "{{ item }}"
+        state: absent
+        update_cache: yes
+      with_items:
+        - python-jenkins
+        - python-six
+        - python-tox
+
+    - name: install python deps via pip
+      pip:
+        name: "{{ item }}"
+        state: latest
+      with_items:
+        - six
+        - tox
+
+    - name: install python-jenkins via pip
+      # HORRIBLY BROKEN. This is temporary until this lands upstream:
+      # https://github.com/ceph/python-jenkins/commit/8e018bf7d88dfc308833d195a6ebd29231a8969d
+      # https://review.openstack.org/460363
+      pip: name=git+https://github.com/ceph/python-jenkins@patched#egg=python-jenkins
+
+    - name: add github.com host key
+      known_hosts:
+        path: '/etc/ssh/ssh_known_hosts'
+        # we need to use 'host' here because prado currently uses ansible-playbook==1.9.1
+        host: 'github.com'
+        # github.com.pub is the output of `ssh-keyscan github.com`
+        key: "{{ lookup('file', 'playbook/files/ssh/hostkeys/github.com.pub') }}"
+
+    - name: register the new slave to jenkins master with ssh
+      jenkins_node:
+        username: "{{ api_user }}"
+        uri: "{{ api_uri }}"
+        password: "{{ api_token }}"
+        # relies on a convention to set a unique name that allows a reverse
+        # mapping from Jenkins back to whatever service created the current
+        # node
+        name: "{{ ansible_default_ipv4.address }}+{{ nodename }}"
+        labels: "{{ labels }}"
+        host: "{{ ansible_default_ipv4.address }}"
+        credentialsId: "{{ jenkins_credentials_id }}"
+        remoteFS: '/home/{{ jenkins_user }}/build'
+        executors: '{{ executors|default(1) }}'
+        exclusive: true
+      when: not use_jnlp
+
+    - name: register the new slave to jenkins master with jnlp
+      jenkins_node:
+        username: "{{ api_user }}"
+        uri: "{{ api_uri }}"
+        password: "{{ api_token }}"
+        # relies on a convention to set a unique name that allows a reverse
+        # mapping from Jenkins back to whatever service created the current
+        # node
+        name: "{{ ansible_default_ipv4.address }}+{{ nodename }}"
+        labels: "{{ labels }}"
+        host: "{{ ansible_default_ipv4.address }}"
+        credentialsId: "{{ jenkins_credentials_id }}"
+        launcher: 'hudson.slaves.JNLPLauncher'
+        remoteFS: '/home/{{ jenkins_user }}/build'
+        # XXX this should be configurable, not all nodes should have one executor
+        executors: '{{ executors|default(1) }}'
+        exclusive: true
+      when: use_jnlp
+
+    - name: Download slave.jar
+      get_url:
+        url: "{{ api_uri }}/jnlpJars/slave.jar"
+        dest: "/home/{{ jenkins_user }}/slave.jar"
+        validate_certs: false
+      when: use_jnlp
+
+    - name: install the systemd unit file for jenkins
+      template:
+        src: "templates/systemd/jenkins.service.j2"
+        dest: "/etc/systemd/system/jenkins.service"
+      when: use_jnlp
+
+    - name: start jenkins service
+      service:
+        name: jenkins
+        state: started
+        enabled: yes
+      when: use_jnlp
+
