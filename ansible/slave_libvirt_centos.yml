@@ -55,6 +55,7 @@
         - java-1.8.0-openjdk-devel
         - qemu-kvm
         - libvirt-devel
+        - libvirt-client
         - libguestfs
         - libvirt
         - libguestfs-tools
