@@ -322,6 +322,15 @@
             - ../../../scripts/build_utils.sh
             - ../../build/build
 
+    wrappers:
+      - inject-passwords:
+          global: true
+          mask-password-params: true
+      - credentials-binding:
+          - text:
+              credential-id: 943e003e-52b4-4d56-84d4-245037014718
+              variable: GITHUB_TOKEN
+
     publishers:
       - postbuildscript:
           builders:
